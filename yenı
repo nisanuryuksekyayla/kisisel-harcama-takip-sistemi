@@ -1,0 +1,305 @@
+// ExpenseTracker.Core.cs
+// Core backend for the WinForms Personal Expense Tracker (OOP + SQLite)
+// Includes: Models (Expense, AppSetting), Data (Database), Services (ExpenseService, SettingsService)
+// Target packages: System.Data.SQLite (install via NuGet)
+
+using System;
+using System.Collections.Generic;
+using System.Data;
+using System.Data.SQLite;
+using System.Globalization;
+
+namespace ExpenseTracker.Models
+{
+    public class Expense
+    {
+        public int Id { get; set; }
+        public DateTime Date { get; set; }
+        public decimal Amount { get; set; }
+        public string Category { get; set; } = string.Empty;
+        public string Description { get; set; } = string.Empty;
+    }
+
+    public class AppSetting
+    {
+        public string Key { get; set; } = string.Empty;
+        public string Value { get; set; } = string.Empty;
+    }
+}
+
+namespace ExpenseTracker.Data
+{
+    public static class Database
+    {
+        private static readonly string _dbFile = "expenses.db";
+        private static readonly string _connectionString =
+            $"Data Source={_dbFile};Version=3;foreign keys=true;journal mode=WAL;";
+
+        public static string ConnectionString => _connectionString;
+
+        public static void Initialize()
+        {
+            using var conn = new SQLiteConnection(_connectionString);
+            conn.Open();
+
+            // Execute PRAGMA and table creation separately for clarity and compatibility
+            using (var pragmaCmd = conn.CreateCommand())
+            {
+                pragmaCmd.CommandText = "PRAGMA foreign_keys = ON;";
+                pragmaCmd.ExecuteNonQuery();
+            }
+
+            using (var tableCmd = conn.CreateCommand())
+            {
+                tableCmd.CommandText = @"
+                    CREATE TABLE IF NOT EXISTS expenses (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        date TEXT NOT NULL,
+                        amount REAL NOT NULL,
+                        category TEXT NOT NULL,
+                        description TEXT
+                    );";
+                tableCmd.ExecuteNonQuery();
+            }
+
+            using (var settingsCmd = conn.CreateCommand())
+            {
+                settingsCmd.CommandText = @"
+                    CREATE TABLE IF NOT EXISTS settings (
+                        key TEXT PRIMARY KEY,
+                        value TEXT
+                    );";
+                settingsCmd.ExecuteNonQuery();
+            }
+        }
+
+        public static SQLiteConnection GetConnection()
+        {
+            var conn = new SQLiteConnection(_connectionString);
+            conn.Open();
+            using var pragma = conn.CreateCommand();
+            pragma.CommandText = "PRAGMA foreign_keys = ON;";
+            pragma.ExecuteNonQuery();
+            return conn;
+        }
+    }
+}
+
+namespace ExpenseTracker.Services
+{
+    using ExpenseTracker.Models;
+    using ExpenseTracker.Data;
+
+    public class ExpenseService
+    {
+        public ExpenseService()
+        {
+            Database.Initialize();
+        }
+
+        public int AddExpense(Expense e)
+        {
+            using var conn = Database.GetConnection();
+            using var cmd = conn.CreateCommand();
+            cmd.CommandText = @"INSERT INTO expenses(date, amount, category, description)
+                                VALUES (@date, @amount, @category, @description);
+                                SELECT last_insert_rowid();";
+            cmd.Parameters.AddWithValue("@date", e.Date.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture));
+            cmd.Parameters.AddWithValue("@amount", e.Amount);
+            cmd.Parameters.AddWithValue("@category", e.Category);
+            cmd.Parameters.AddWithValue("@description", string.IsNullOrWhiteSpace(e.Description) ? (object)DBNull.Value : e.Description);
+
+            return Convert.ToInt32(cmd.ExecuteScalar());
+        }
+
+        public void UpdateExpense(Expense e)
+        {
+            using var conn = Database.GetConnection();
+            using var cmd = conn.CreateCommand();
+            cmd.CommandText = @"UPDATE expenses
+                                SET date=@date, amount=@amount, category=@category, description=@description
+                                WHERE id=@id";
+            cmd.Parameters.AddWithValue("@date", e.Date.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture));
+            cmd.Parameters.AddWithValue("@amount", e.Amount);
+            cmd.Parameters.AddWithValue("@category", e.Category);
+            cmd.Parameters.AddWithValue("@description", string.IsNullOrWhiteSpace(e.Description) ? (object)DBNull.Value : e.Description);
+            cmd.Parameters.AddWithValue("@id", e.Id);
+            cmd.ExecuteNonQuery();
+        }
+
+        public void DeleteExpense(int id)
+        {
+            using var conn = Database.GetConnection();
+            using var cmd = conn.CreateCommand();
+            cmd.CommandText = "DELETE FROM expenses WHERE id=@id";
+            cmd.Parameters.AddWithValue("@id", id);
+            cmd.ExecuteNonQuery();
+        }
+
+        public Expense? GetExpenseById(int id)
+        {
+            using var conn = Database.GetConnection();
+            using var cmd = conn.CreateCommand();
+            cmd.CommandText = "SELECT id, date, amount, category, description FROM expenses WHERE id=@id";
+            cmd.Parameters.AddWithValue("@id", id);
+
+            using var reader = cmd.ExecuteReader();
+            return reader.Read() ? MapExpense(reader) : null;
+        }
+
+        public List<Expense> GetAllExpenses()
+        {
+            using var conn = Database.GetConnection();
+            using var cmd = conn.CreateCommand();
+            cmd.CommandText = "SELECT id, date, amount, category, description FROM expenses ORDER BY date DESC, id DESC";
+            using var reader = cmd.ExecuteReader();
+
+            var list = new List<Expense>();
+            while (reader.Read())
+            {
+                list.Add(MapExpense(reader));
+            }
+            return list;
+        }
+
+        public List<Expense> GetMonthlyExpenses(int year, int month)
+        {
+            using var conn = Database.GetConnection();
+            using var cmd = conn.CreateCommand();
+            string prefix = new DateTime(year, month, 1).ToString("yyyy-MM", CultureInfo.InvariantCulture);
+            cmd.CommandText = @"SELECT id, date, amount, category, description
+                                FROM expenses
+                                WHERE date LIKE @prefix || '%'
+                                ORDER BY date DESC, id DESC";
+            cmd.Parameters.AddWithValue("@prefix", prefix);
+
+            var list = new List<Expense>();
+            using var reader = cmd.ExecuteReader();
+            while (reader.Read())
+            {
+                list.Add(MapExpense(reader));
+            }
+            return list;
+        }
+
+        public decimal GetMonthlyTotal(int year, int month)
+        {
+            using var conn = Database.GetConnection();
+            using var cmd = conn.CreateCommand();
+            string prefix = new DateTime(year, month, 1).ToString("yyyy-MM", CultureInfo.InvariantCulture);
+            cmd.CommandText = @"SELECT IFNULL(SUM(amount), 0)
+                                FROM expenses
+                                WHERE date LIKE @prefix || '%'";
+            cmd.Parameters.AddWithValue("@prefix", prefix);
+            var result = cmd.ExecuteScalar();
+            return result != null && result != DBNull.Value ? Convert.ToDecimal(result) : 0m;
+        }
+
+        public Dictionary<string, decimal> GetMonthlyTotalsByCategory(int year, int month)
+        {
+            using var conn = Database.GetConnection();
+            using var cmd = conn.CreateCommand();
+            string prefix = new DateTime(year, month, 1).ToString("yyyy-MM", CultureInfo.InvariantCulture);
+            cmd.CommandText = @"SELECT category, IFNULL(SUM(amount), 0) AS total
+                                FROM expenses
+                                WHERE date LIKE @prefix || '%'
+                                GROUP BY category
+                                ORDER BY total DESC";
+            cmd.Parameters.AddWithValue("@prefix", prefix);
+
+            var dict = new Dictionary<string, decimal>(StringComparer.OrdinalIgnoreCase);
+            using var reader = cmd.ExecuteReader();
+            while (reader.Read())
+            {
+                var cat = reader.GetString(0);
+                var total = reader[1] != DBNull.Value ? Convert.ToDecimal(reader[1]) : 0m;
+                dict[cat] = total;
+            }
+            return dict;
+        }
+
+        private Expense MapExpense(IDataRecord r)
+        {
+            return new Expense
+            {
+                Id = Convert.ToInt32(r["id"]),
+                Date = DateTime.ParseExact(Convert.ToString(r["date"])!, "yyyy-MM-dd", CultureInfo.InvariantCulture),
+                Amount = Convert.ToDecimal(r["amount"]),
+                Category = Convert.ToString(r["category"]) ?? string.Empty,
+                Description = r["description"] == DBNull.Value ? string.Empty : Convert.ToString(r["description"]) ?? string.Empty
+            };
+        }
+    }
+
+    public class SettingsService
+    {
+        private const string MonthlyBudgetKey = "MonthlyBudget";
+        private readonly ExpenseService _expenseService;
+
+        public SettingsService(ExpenseService? expenseService = null)
+        {
+            Database.Initialize();
+            _expenseService = expenseService ?? new ExpenseService();
+        }
+
+        public decimal GetMonthlyBudget()
+        {
+            using var conn = Database.GetConnection();
+            using var cmd = conn.CreateCommand();
+            cmd.CommandText = "SELECT value FROM settings WHERE key=@k";
+            cmd.Parameters.AddWithValue("@k", MonthlyBudgetKey);
+            var result = cmd.ExecuteScalar();
+            return result != null && result != DBNull.Value &&
+                   decimal.TryParse(Convert.ToString(result), NumberStyles.Number, CultureInfo.InvariantCulture, out var val)
+                ? val
+                : 0m;
+        }
+
+        public void SetMonthlyBudget(decimal amount)
+        {
+            using var conn = Database.GetConnection();
+            using var cmd = conn.CreateCommand();
+            cmd.CommandText = @"INSERT INTO settings(key, value) VALUES(@k, @v)
+                                ON CONFLICT(key) DO UPDATE SET value=excluded.value";
+            cmd.Parameters.AddWithValue("@k", MonthlyBudgetKey);
+            cmd.Parameters.AddWithValue("@v", amount.ToString(CultureInfo.InvariantCulture));
+            cmd.ExecuteNonQuery();
+        }
+
+        public bool IsOverBudget(int year, int month, decimal? overrideBudget = null)
+        {
+            var budget = overrideBudget ?? GetMonthlyBudget();
+            var total = _expenseService.GetMonthlyTotal(year, month);
+            return budget > 0 && total > budget;
+        }
+    }
+}
+
+namespace ExpenseTracker
+{
+    using ExpenseTracker.Services;
+    using ExpenseTracker.Models;
+
+    public static class Demo
+    {
+        // Console-based demo helpers for quick manual testing.
+        public static void RunOnce()
+        {
+            var expenseService = new ExpenseService();
+            var settings = new SettingsService(expenseService);
+
+            // Ensure DB exists
+            _ = settings.GetMonthlyBudget();
+
+            // Example usage:
+            // var id = expenseService.AddExpense(new Expense
+            // {
+            //     Date = DateTime.Today,
+            //     Amount = 150.75m,
+            //     Category = "Market",
+            //     Description = "Haftalık alışveriş"
+            // });
+            // Console.WriteLine($"Inserted expense id: {id}");
+        }
+    }
+}
